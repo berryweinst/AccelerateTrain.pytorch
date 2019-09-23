@@ -19,6 +19,19 @@ It is based off [imagenet example in pytorch](https://github.com/pytorch/example
  git clone --recursive https://github.com/eladhoffer/convNet.pytorch
  ```
  
+ example for SELECTIVESAMPLINGFORACCELERATINGTHETRAINING  OF DEEP NEURAL NETWORKS:
+ 
+ 1) CIFAR10:
+ ```
+ python main.py --dataset cifar10 --model resnet --model-config "{'depth': 44, 'regime':'normalselective'}" -b 64 --epochs 2000 --save resnet44_cifar10_accelerate --device-ids 3 -sb 640
+```
+ 2) CIFAR100:
+ ```
+ python main.py --dataset cifar100 --model resnet --model-config "{'depth': 28, 'regime':'wide-resnet_selective','width': [160, 320, 640]}" -b 64 --epochs 2000 --save resnet28_wide_cifar100_accelerate --device-ids 3 --autoaugment --cutout -sb 640
+```
+
+
+ 
  example for efficient multi-gpu training of resnet50 (4 gpus, label-smoothing):
  ```
  python -m torch.distributed.launch --nproc_per_node=4  main.py --model resnet --model-config "{'depth': 50}" --eval-batch-size 512 --save resnet50_ls --label-smoothing 0.1
