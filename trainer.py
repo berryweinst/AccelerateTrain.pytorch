@@ -335,3 +335,362 @@ class Trainer(object):
         self.get_stream('train_prec1')
         self.get_stream('eval_prec1')
         self.get_stream('lr')
+        
+       
+class SelectionTrainer(Trainer):
+
+    def __init__(self, *kargs,  **kwargs):
+        super(SelectionTrainer, self).__init__(*kargs,  **kwargs)
+        self.data_loader = kwargs.pop('data_loader', None)
+        self.ratio = kwargs.pop('ratio', 10)
+        
+
+
+    def select_1st_2nd_smallest(self, inputs, target, meters):
+        self.model.eval()
+        with torch.no_grad():
+            inputs = inputs.to(self.device, dtype=self.dtype)
+            target = target.to(self.device)
+            logit, _ = self.model(inputs)
+            topk_vals, pred_classes = logit.topk(2, 1)
+
+
+            w1 = self.model.fc.weight.index_select(0, pred_classes[:, 0])
+            w2 = self.model.fc.weight.index_select(0, pred_classes[:, 1])
+            entropy_logit = (topk_vals[:,0] - topk_vals[:,1]) / (w1 - w2).norm(dim=-1)
+
+            _, max_entr_indices1 = torch.sort(entropy_logit)
+
+            confidence_top10 = torch.mean(entropy_logit[max_entr_indices1][:10])
+            meters['confidence'].update(float(confidence_top10), 1)
+
+            # classes = pred_classes[:, 0].unique()
+            # target_ordered = pred_classes[:, 0].index_select(0, max_entr_indices1)
+            # classes = target.unique()
+            # target_ordered = target.index_select(0, max_entr_indices1)
+            # idx_target = list(zip(max_entr_indices1.tolist(), target_ordered.tolist()))
+            # classes = classes.tolist()
+            # shuffle(classes)
+            # classes_items = {c: [] for c in classes}
+            #
+            # def select_balanced(num, classes_items=classes_items, classes=classes, idx_target=idx_target):
+            #     curr_c_num = 0
+            #     while sum([len(c) for c in classes_items.values()]) < num:
+            #         for i, (idx, c) in enumerate(idx_target):
+            #             if c == classes[curr_c_num]:
+            #                 idx_target.pop(i)
+            #                 classes_items[c].append(idx)
+            #                 break
+            #         curr_c_num += 1
+            #         if curr_c_num >= len(classes):
+            #             curr_c_num = 0
+            #
+            # select_balanced(self.batch_size)
+            # indices = []
+            # for v in classes_items.values():
+            #     indices += v
+            # shuffle(indices)
+            # max_entr_indices1 = torch.tensor(indices, device=inputs.device, dtype=torch.long)
+
+            max_entr_indices1 = max_entr_indices1[:self.batch_size]
+        self.model.train()
+        return inputs[max_entr_indices1], target[max_entr_indices1] #, bindices[max_entr_indices1]
+
+
+
+
+    def forward(self, data_loader, num_steps=None, training=False, average_output=False, chunk_batch=1):
+        self.train_batches = len(data_loader)
+        meters = {name: AverageMeter()
+                  for name in ['step', 'data', 'loss', 'prec1', 'prec5', 'samples', 'confidence']}
+        if training and self.grad_clip > 0:
+            meters['grad'] = AverageMeter()
+        if self.calc_grad_var is not None:
+            var_meter = OnlineMeter()
+            meters['grad_var'] = AverageMeter()
+
+        batch_first = True
+        if training and isinstance(self.model, nn.DataParallel) or chunk_batch > 1:
+            batch_first = False
+
+        def meter_results(meters):
+            results = {name: meter.avg for name, meter in meters.items()}
+            results['error1'] = 100. - results['prec1']
+            results['error5'] = 100. - results['prec5']
+            return results
+
+        end = time.time()
+
+        start_lr = self.optimizer.get_lr()[0]
+        for i, (inputs, target) in enumerate(data_loader):
+
+            # measure data loading time
+            meters['data'].update(time.time() - end)
+
+            
+            inputs, target = self.select_1st_2nd_smallest(inputs, target, meters)
+            
+
+            output, loss, grad = self._step(inputs, target,
+                                            training=training,
+                                            average_output=average_output,
+                                            chunk_batch=chunk_batch)
+
+            if self.calc_grad_var is not None:
+                var_meter.update(self.collect_flatten_grads_(self.model.parameters()))
+                if (self.training_steps + 1) % self.calc_grad_var == 0:
+                    meters['grad_var'].update(float(var_meter.var.mean()), inputs.size(0))
+                    var_meter.needs_init = True
+
+            # measure accuracy and record loss
+            prec1, prec5 = accuracy(output, target, topk=(1, 5))
+            meters['loss'].update(float(loss), inputs.size(0))
+            meters['prec1'].update(float(prec1), inputs.size(0))
+            meters['prec5'].update(float(prec5), inputs.size(0))
+            # self.data_idx_set.update(set(bindices.tolist()))
+            # meters['samples'].update(int(len(self.data_idx_set)), 1)
+            if grad is not None:
+                meters['grad'].update(float(grad), inputs.size(0))
+
+            # measure elapsed time
+            meters['step'].update(time.time() - end)
+            end = time.time()
+
+            if i % self.print_freq == 0 or i == len(data_loader) - 1:
+                report = str('{phase} - Epoch: [{0}][{1}/{2}]\t'
+                             'Time {meters[step].val:.3f} ({meters[step].avg:.3f})\t'
+                             'Data {meters[data].val:.3f} ({meters[data].avg:.3f})\t'
+                             'Loss {meters[loss].val:.4f} ({meters[loss].avg:.4f})\t'
+                             'Prec@1 {meters[prec1].val:.3f} ({meters[prec1].avg:.3f})\t'
+                             'Prec@5 {meters[prec5].val:.3f} ({meters[prec5].avg:.3f})\t'
+                             # 'Samples {meters[samples].val}\t'
+                             'Confidence {meters[confidence].val}\t'
+                             .format(
+                                 self.epoch, i, len(data_loader),
+                                 phase='TRAINING' if training else 'EVALUATING',
+                                 meters=meters))
+                if 'grad' in meters.keys():
+                    report += 'Grad {meters[grad].val:.3f} ({meters[grad].avg:.3f})'\
+                        .format(meters=meters)
+                logging.info(report)
+                self.observe(trainer=self,
+                             model=self._model,
+                             optimizer=self.optimizer,
+                             data=(inputs, target))
+                self.stream_meters(meters,
+                                   prefix='train' if training else 'eval')
+                if training:
+                    self.write_stream('lr',
+                                      (self.training_steps, self.optimizer.get_lr()[0]))
+
+            if num_steps is not None and i >= num_steps:
+                break
+        # if start_lr != self.optimizer.get_lr()[0] and start_lr != 0 and self.use_rand_selection == False:
+        #     self.use_rand_selection = True
+        #     print('Switching to random selection at epoch %d' % (self.epoch))
+        # self.update_sel_ratio()
+
+        return meter_results(meters)
+
+
+    def train(self, data_loader, duplicates=1, chunk_batch=1):
+        # switch to train mode
+        self.model.train()
+
+        return self.forward(data_loader, training=True, chunk_batch=chunk_batch)
+
+
+    def validate(self, data_loader, duplicates=1):
+        # switch to evaluate mode
+        if self.training_steps % (self.train_batches * self.ratio) == 0:
+            self.model.eval()
+            with torch.no_grad():
+                return super(SelectionTrainer, self).forward(data_loader, training=False)
+        else:
+            return None
+
+
+
+
+class HardNegativeTrainer(Trainer):
+
+    def __init__(self, *kargs,  **kwargs):
+        self.ratio = kwargs.pop('ratio', 10)
+        self.nm_min = kwargs.pop('nm_min', 0)
+        self.nm_max = kwargs.pop('nm_max', 1)
+        self.nm_rate = kwargs.pop('nm_rate', 1./10.)
+        super(HardNegativeTrainer, self).__init__(*kargs,  **kwargs)
+
+
+
+    def select_hard_samples(self, inputs, target, meters):
+        self.model.eval()
+        with torch.no_grad():
+
+            logit, _ = self.model(inputs)
+
+            scores = nn.functional.cross_entropy(logit, target, reduction='none')
+            classes = target.unique()
+            _, indices = scores.sort(dim=0, descending=True)
+            target_ordered = target.index_select(
+                0, indices.to(device=target.device))
+            idx_target = list(zip(indices.tolist(), target_ordered.tolist()))
+            classes = classes.tolist()
+            shuffle(classes)
+            classes_items = {c: [] for c in classes}
+            ratio_hard = max(
+                min(self.nm_max, (self.epoch + 1) * self.nm_rate), self.nm_min)
+
+            def select_balanced(num, classes_items=classes_items, classes=classes, idx_target=idx_target):
+                curr_c_num = 0
+                while sum([len(c) for c in classes_items.values()]) < num:
+                    for i, (idx, c) in enumerate(idx_target):
+                        if c == classes[curr_c_num]:
+                            idx_target.pop(i)
+                            classes_items[c].append(idx)
+                            break
+                    curr_c_num += 1
+                    if curr_c_num >= len(classes):
+                        curr_c_num = 0
+
+            select_balanced(ratio_hard * self.batch_size)
+            shuffle(idx_target)
+            select_balanced(self.batch_size)
+
+            indices = []
+            for v in classes_items.values():
+                indices += v
+
+            indices_left = list(set(range(inputs.size(0))) - set(indices))
+
+            shuffle(indices)
+            max_entr_indices1 = torch.tensor(indices, device=inputs.device, dtype=torch.long)
+            # indices_left = torch.tensor(indices_left, device=inputs.device, dtype=torch.long)
+
+            topk_vals, pred_classes = logit[max_entr_indices1].topk(2, 1)
+            w1 = self.model.fc.weight.index_select(0, pred_classes[:, 0])
+            w2 = self.model.fc.weight.index_select(0, pred_classes[:, 1])
+            entropy_logit = (topk_vals[:,0] - topk_vals[:,1]) / (w1 - w2).norm(dim=-1)
+            _, meas_indices = torch.sort(entropy_logit)
+
+            confidence_top10 = torch.mean(entropy_logit[meas_indices][:10])
+            meters['confidence'].update(float(confidence_top10), 1)
+
+            # max_entr_indices1 = indices[:self.batch_size]
+        self.model.train()
+        return inputs[max_entr_indices1], target[max_entr_indices1] #, inputs[indices_left], target[indices_left]
+
+
+
+
+    def forward(self, data_loader, num_steps=None, training=False, average_output=False, chunk_batch=1):
+        self.train_batches = len(data_loader)
+        meters = {name: AverageMeter()
+                  for name in ['step', 'data', 'loss', 'prec1', 'prec5', 'samples', 'confidence']}
+        if training and self.grad_clip > 0:
+            meters['grad'] = AverageMeter()
+        if self.calc_grad_var is not None:
+            var_meter = OnlineMeter()
+            meters['grad_var'] = AverageMeter()
+
+        batch_first = True
+        if training and isinstance(self.model, nn.DataParallel) or chunk_batch > 1:
+            batch_first = False
+
+        def meter_results(meters):
+            results = {name: meter.avg for name, meter in meters.items()}
+            results['error1'] = 100. - results['prec1']
+            results['error5'] = 100. - results['prec5']
+            return results
+
+        end = time.time()
+
+
+        for i, (inputs, target) in enumerate(data_loader):
+
+            # measure data loading time
+            meters['data'].update(time.time() - end)
+            inputs = inputs.to(self.device, dtype=self.dtype)
+            target = target.to(self.device)
+
+            if training:
+                
+                inputs, target = self.select_hard_samples(inputs, target, meters)
+
+              
+            target = target.to(self.device)
+            inputs = inputs.to(self.device, dtype=self.dtype)
+
+            output, loss, grad = self._step(inputs, target,
+                                            training=training,
+                                            average_output=average_output,
+                                            chunk_batch=chunk_batch)
+
+            if self.calc_grad_var is not None:
+                var_meter.update(self.collect_flatten_grads_(self.model.parameters()))
+                if (self.training_steps + 1) % self.calc_grad_var == 0:
+                    meters['grad_var'].update(float(var_meter.var.mean()), inputs.size(0))
+                    var_meter.needs_init = True
+
+            # measure accuracy and record loss
+            prec1, prec5 = accuracy(output, target, topk=(1, 5))
+            meters['loss'].update(float(loss), inputs.size(0))
+            meters['prec1'].update(float(prec1), inputs.size(0))
+            meters['prec5'].update(float(prec5), inputs.size(0))
+           
+            if grad is not None:
+                meters['grad'].update(float(grad), inputs.size(0))
+
+            # measure elapsed time
+            meters['step'].update(time.time() - end)
+            end = time.time()
+
+            if i % self.print_freq == 0 or i == len(data_loader) - 1:
+                report = str('{phase} - Epoch: [{0}][{1}/{2}]\t'
+                             'Time {meters[step].val:.3f} ({meters[step].avg:.3f})\t'
+                             'Data {meters[data].val:.3f} ({meters[data].avg:.3f})\t'
+                             'Loss {meters[loss].val:.4f} ({meters[loss].avg:.4f})\t'
+                             'Prec@1 {meters[prec1].val:.3f} ({meters[prec1].avg:.3f})\t'
+                             'Prec@5 {meters[prec5].val:.3f} ({meters[prec5].avg:.3f})\t'
+                             # 'Samples {meters[samples].val}\t'
+                             'Confidence {meters[confidence].val}\t'
+                             .format(
+                                 self.epoch, i, len(data_loader),
+                                 phase='TRAINING' if training else 'EVALUATING',
+                                 meters=meters))
+                if 'grad' in meters.keys():
+                    report += 'Grad {meters[grad].val:.3f} ({meters[grad].avg:.3f})'\
+                        .format(meters=meters)
+                logging.info(report)
+                self.observe(trainer=self,
+                             model=self._model,
+                             optimizer=self.optimizer,
+                             data=(inputs, target))
+                self.stream_meters(meters,
+                                   prefix='train' if training else 'eval')
+                if training:
+                    self.write_stream('lr',
+                                      (self.training_steps, self.optimizer.get_lr()[0]))
+
+            if num_steps is not None and i >= num_steps:
+                break
+       
+        return meter_results(meters)
+
+
+    def train(self, data_loader, duplicates=1, chunk_batch=1):
+        # switch to train mode
+        self.model.train()
+
+        return self.forward(data_loader, training=True, chunk_batch=chunk_batch)
+
+
+    def validate(self, data_loader, duplicates=1):
+        # switch to evaluate mode
+        if self.training_steps % (self.train_batches * self.ratio) == 0:
+            self.model.eval()
+            with torch.no_grad():
+                return super(HardNegativeTrainer, self).forward(data_loader, training=False)
+        else:
+            return None
+
