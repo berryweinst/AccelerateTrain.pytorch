@@ -19,7 +19,7 @@ from utils.misc import torch_dtypes
 from utils.param_filter import FilterModules, is_bn
 from datetime import datetime
 from ast import literal_eval
-from trainer import Trainer
+from trainer import Trainer, SelectionTrainer, LabelSelectTrainer, HardNegativeTrainer, NMAugmentTrainer
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
@@ -32,7 +32,7 @@ parser.add_argument('--results-dir', metavar='RESULTS_DIR', default='./results',
                     help='results dir')
 parser.add_argument('--save', metavar='SAVE', default='',
                     help='saved folder')
-parser.add_argument('--datasets-dir', metavar='DATASETS_DIR', default='~/Datasets',
+parser.add_argument('--datasets-dir', metavar='DATASETS_DIR', default='/media/Datasets',
                     help='datasets dir')
 parser.add_argument('--dataset', metavar='DATASET', default='imagenet',
                     help='dataset name or folder')
@@ -81,8 +81,6 @@ parser.add_argument('--label-smoothing', default=0, type=float,
                     help='label smoothing coefficient - default 0')
 parser.add_argument('--mixup', default=None, type=float,
                     help='mixup alpha coefficient - default None')
-parser.add_argument('--cutmix', default=None, type=float,
-                    help='cutmix alpha coefficient - default None')
 parser.add_argument('--duplicates', default=1, type=int,
                     help='number of augmentations over singel example')
 parser.add_argument('--chunk-batch', default=1, type=int,
@@ -115,6 +113,10 @@ parser.add_argument('--tensorwatch', action='store_true', default=False,
                     help='set tensorwatch logging')
 parser.add_argument('--tensorwatch-port', default=0, type=int,
                     help='set tensorwatch port')
+parser.add_argument('-sb', '--sel_batch-size', default=64, type=int,
+                    metavar='N', help='mini-batch size for selection (default: 256)')
+parser.add_argument('--calc-grad-var', default=None, type=int,
+                    help='amount of steps to calc grad variance')
 
 
 def main():
@@ -248,10 +250,46 @@ def main_worker(args):
     if optim_state_dict is not None:
         optimizer.load_state_dict(optim_state_dict)
 
-    trainer = Trainer(model, criterion, optimizer,
-                      device_ids=args.device_ids, device=args.device, dtype=dtype, print_freq=args.print_freq,
-                      distributed=args.distributed, local_rank=args.local_rank, mixup=args.mixup, cutmix=args.cutmix,
-                      loss_scale=args.loss_scale, grad_clip=args.grad_clip,  adapt_grad_norm=args.adapt_grad_norm)
+    if 'selective' in model_config['regime']:
+        trainer = SelectionTrainer(model, criterion, optimizer,
+                                   device_ids=args.device_ids, device=args.device, dtype=dtype,
+                                   distributed=args.distributed, local_rank=args.local_rank, mixup=args.mixup,
+                                   loss_scale=args.loss_scale,
+                                   grad_clip=args.grad_clip, print_freq=args.print_freq,
+                                   adapt_grad_norm=args.adapt_grad_norm, batch_size=args.batch_size,
+                                   calc_grad_var=args.calc_grad_var)
+    elif 'label_select' in model_config['regime']:
+        trainer = LabelSelectTrainer(model, criterion, optimizer,
+                                     device_ids=args.device_ids, device=args.device, dtype=dtype,
+                                     distributed=args.distributed, local_rank=args.local_rank, mixup=args.mixup,
+                                     loss_scale=args.loss_scale,
+                                     grad_clip=args.grad_clip, print_freq=args.print_freq,
+                                     adapt_grad_norm=args.adapt_grad_norm, batch_size=args.batch_size,
+                                     calc_grad_var=args.calc_grad_var)
+    elif 'hard_select' in model_config['regime']:
+        trainer = HardNegativeTrainer(model, criterion, optimizer,
+                                     device_ids=args.device_ids, device=args.device, dtype=dtype,
+                                     distributed=args.distributed, local_rank=args.local_rank, mixup=args.mixup,
+                                     loss_scale=args.loss_scale,
+                                     grad_clip=args.grad_clip, print_freq=args.print_freq,
+                                     adapt_grad_norm=args.adapt_grad_norm, batch_size=args.batch_size,
+                                     calc_grad_var=args.calc_grad_var)
+    elif 'augment_select' in model_config['regime']:
+        trainer = NMAugmentTrainer(model, criterion, optimizer,
+                                     device_ids=args.device_ids, device=args.device, dtype=dtype,
+                                     distributed=args.distributed, local_rank=args.local_rank, mixup=args.mixup,
+                                     loss_scale=args.loss_scale,
+                                     grad_clip=args.grad_clip, print_freq=args.print_freq,
+                                     adapt_grad_norm=args.adapt_grad_norm, batch_size=args.batch_size,
+                                     calc_grad_var=args.calc_grad_var)
+    else:
+        trainer = Trainer(model, criterion, optimizer,
+                          device_ids=args.device_ids, device=args.device, dtype=dtype,
+                          distributed=args.distributed, local_rank=args.local_rank, mixup=args.mixup, loss_scale=args.loss_scale,
+                          grad_clip=args.grad_clip, print_freq=args.print_freq, adapt_grad_norm=args.adapt_grad_norm, batch_size=args.batch_size,
+                          calc_grad_var=args.calc_grad_var)
+
+
     if args.tensorwatch:
         trainer.set_watcher(filename=path.abspath(path.join(save_path, 'tensorwatch.log')),
                             port=args.tensorwatch_port)
@@ -270,7 +308,7 @@ def main_worker(args):
 
     # Training Data loading code
     train_data_defaults = {'datasets_path': args.datasets_dir, 'name': args.dataset, 'split': 'train', 'augment': True,
-                           'input_size': args.input_size,  'batch_size': args.batch_size, 'shuffle': True,
+                           'input_size': args.input_size,  'batch_size': args.sel_batch_size, 'shuffle': True,
                            'num_workers': args.workers, 'pin_memory': True, 'drop_last': True,
                            'distributed': args.distributed, 'duplicates': args.duplicates, 'autoaugment': args.autoaugment,
                            'cutout': {'holes': 1, 'length': 16} if args.cutout else None}
@@ -289,14 +327,13 @@ def main_worker(args):
             getattr(model, 'data_regime', None), defaults=train_data_defaults)
 
     logging.info('optimization regime: %s', optim_regime)
-    logging.info('data regime: %s', train_data)
     args.start_epoch = max(args.start_epoch, 0)
-    trainer.training_steps = args.start_epoch * len(train_data)
+    trainer.training_steps = args.start_epoch * 500 #len(train_data.get_loader())
     for epoch in range(args.start_epoch, args.epochs):
         trainer.epoch = epoch
         train_data.set_epoch(epoch)
         val_data.set_epoch(epoch)
-        logging.info('\nStarting Epoch: {0}\n'.format(epoch + 1))
+        logging.info('\nStarting Epoch: {0}, Training steps: {1}\n'.format(epoch + 1, trainer.training_steps + 1))
 
         # train for one epoch
         train_results = trainer.train(train_data.get_loader(),
@@ -305,8 +342,12 @@ def main_worker(args):
         # evaluate on validation set
         val_results = trainer.validate(val_data.get_loader())
 
-        if args.distributed and args.local_rank > 0:
+        if (args.distributed and args.local_rank > 0) or val_results is None:
             continue
+
+
+        # if isinstance(trainer, LabelSelectTrainer):
+        #     trainer.curr_val_acc = val_results['prec1']/100.
 
         # remember best prec@1 and save checkpoint
         is_best = val_results['prec1'] > best_prec1
@@ -353,6 +394,10 @@ def main_worker(args):
             results.plot(x='epoch', y=['training grad'],
                          legend=['gradient L2 norm'],
                          title='Gradient Norm', ylabel='value')
+        if 'grad_var' in train_results.keys():
+            results.plot(x='epoch', y=['training grad_var'],
+                         legend=['gradient L2 variance'],
+                         title='Gradient variance', ylabel='value')
         results.save()
 
 
