@@ -19,7 +19,7 @@ It is based off [imagenet example in pytorch](https://github.com/pytorch/example
  git clone --recursive https://github.com/eladhoffer/convNet.pytorch
  ```
  
- example for SELECTIVESAMPLINGFORACCELERATINGTHETRAINING  OF DEEP NEURAL NETWORKS:
+ example for SELECTIVE SAMPLING FOR ACCELERATING THE TRAINING  OF DEEP NEURAL NETWORKS:
  
  1) CIFAR10:
  ```
