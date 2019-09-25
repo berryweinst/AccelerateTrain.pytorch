@@ -345,8 +345,26 @@ class SelectionTrainer(Trainer):
         self.ratio = kwargs.pop('ratio', 10)
         
 
+    def select_largest_entropy(self, inputs, target):
+        self.model.eval()
+        with torch.no_grad():
+            inputs = inputs.to(self.device, dtype=self.dtype)
+            logit, _ = self.model(inputs)
+            # logit = logit.sigmoid()
+            # logit = logit / logit.sum(-1).unsqueeze(-1)
+            # log_logit = torch.log(logit)
+            log_prob_bins = nn.functional.log_softmax(logit, 1)
+            prob_bins = torch.softmax(logit, 1)
 
-    def select_1st_2nd_smallest(self, inputs, target, meters):
+            entropy_logit = torch.sum(-prob_bins * log_prob_bins, dim=1)
+
+            _, max_entr_indices = torch.sort(entropy_logit, descending=True)
+
+            max_entr_indices = max_entr_indices[:self.batch_size]
+        self.model.train()
+        return inputs[max_entr_indices], target[max_entr_indices]
+    
+    def select_mms(self, inputs, target, meters):
         self.model.eval()
         with torch.no_grad():
             inputs = inputs.to(self.device, dtype=self.dtype)
@@ -359,42 +377,14 @@ class SelectionTrainer(Trainer):
             w2 = self.model.fc.weight.index_select(0, pred_classes[:, 1])
             entropy_logit = (topk_vals[:,0] - topk_vals[:,1]) / (w1 - w2).norm(dim=-1)
 
-            _, max_entr_indices1 = torch.sort(entropy_logit)
+            _, min_mms_indices = torch.sort(entropy_logit)
 
-            confidence_top10 = torch.mean(entropy_logit[max_entr_indices1][:10])
+            confidence_top10 = torch.mean(entropy_logit[min_mms_indices][:10])
             meters['confidence'].update(float(confidence_top10), 1)
-
-            # classes = pred_classes[:, 0].unique()
-            # target_ordered = pred_classes[:, 0].index_select(0, max_entr_indices1)
-            # classes = target.unique()
-            # target_ordered = target.index_select(0, max_entr_indices1)
-            # idx_target = list(zip(max_entr_indices1.tolist(), target_ordered.tolist()))
-            # classes = classes.tolist()
-            # shuffle(classes)
-            # classes_items = {c: [] for c in classes}
-            #
-            # def select_balanced(num, classes_items=classes_items, classes=classes, idx_target=idx_target):
-            #     curr_c_num = 0
-            #     while sum([len(c) for c in classes_items.values()]) < num:
-            #         for i, (idx, c) in enumerate(idx_target):
-            #             if c == classes[curr_c_num]:
-            #                 idx_target.pop(i)
-            #                 classes_items[c].append(idx)
-            #                 break
-            #         curr_c_num += 1
-            #         if curr_c_num >= len(classes):
-            #             curr_c_num = 0
-            #
-            # select_balanced(self.batch_size)
-            # indices = []
-            # for v in classes_items.values():
-            #     indices += v
-            # shuffle(indices)
-            # max_entr_indices1 = torch.tensor(indices, device=inputs.device, dtype=torch.long)
-
-            max_entr_indices1 = max_entr_indices1[:self.batch_size]
+            
+            min_mms_indices = min_mms_indices[:self.batch_size]
         self.model.train()
-        return inputs[max_entr_indices1], target[max_entr_indices1] #, bindices[max_entr_indices1]
+        return inputs[min_mms_indices], target[min_mms_indices] 
 
 
 
